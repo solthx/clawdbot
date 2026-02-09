@@ -1,10 +1,10 @@
 package com.openclaw.gateway;
 
-import java.util.concurrent.CompletableFuture;
+import reactor.core.publisher.Mono;
 
 /**
- * Agent runtime abstraction. Replace this with real LLM/tool implementation.
+ * Agent runtime abstraction.
  */
 public interface AgentEngine {
-  CompletableFuture<String> run(String runId, MessageRequest request, RunEventBus eventBus);
+  Mono<String> run(String runId, MessageRequest request, RunEventBus eventBus);
 }

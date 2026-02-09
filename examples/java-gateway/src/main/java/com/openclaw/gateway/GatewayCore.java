@@ -3,69 +3,79 @@ package com.openclaw.gateway;
 import java.time.Duration;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
+
+import org.springframework.stereotype.Service;
+
+import reactor.core.publisher.Mono;
 
 /**
- * Core gateway flow:
- * 1) accept inbound message and return runId immediately
- * 2) execute in session lane + global lane
- * 3) expose wait/run events APIs.
+ * Gateway orchestration core aligned with OpenClaw patterns:
+ * accepted response -> session lane -> global lane -> lifecycle completion.
  */
+@Service
 public final class GatewayCore {
-  private final LaneScheduler scheduler;
-  private final RunEventBus eventBus;
+  private final LaneScheduler scheduler = new LaneScheduler();
+  private final RunEventBus eventBus = new RunEventBus();
   private final AgentEngine agentEngine;
   private final Map<String, String> runByIdempotency = new ConcurrentHashMap<>();
 
-  public GatewayCore(LaneScheduler scheduler, RunEventBus eventBus, AgentEngine agentEngine) {
-    this.scheduler = scheduler;
-    this.eventBus = eventBus;
+  public GatewayCore(AgentEngine agentEngine) {
     this.agentEngine = agentEngine;
+    scheduler.setConcurrency("main", 4);
+    scheduler.setConcurrency("subagent", 8);
   }
 
-  public AcceptedRun accept(MessageRequest request, String requestedLane) {
-    var idempotency = request.idempotencyKey();
-    if (idempotency != null && !idempotency.isBlank()) {
-      var existing = runByIdempotency.get(idempotency);
-      if (existing != null) {
-        return new AcceptedRun(existing, true);
+  public Mono<AcceptedRunResponse> accept(MessageRequest request) {
+    if (request.sessionKey() == null || request.sessionKey().isBlank()) {
+      return Mono.error(new IllegalArgumentException("sessionKey is required"));
+    }
+    if (request.body() == null || request.body().isBlank()) {
+      return Mono.error(new IllegalArgumentException("body is required"));
+    }
+
+    var idempotency = blankToNull(request.idempotencyKey());
+    if (idempotency != null) {
+      var existingRunId = runByIdempotency.get(idempotency);
+      if (existingRunId != null) {
+        return Mono.just(new AcceptedRunResponse(existingRunId, "accepted", System.currentTimeMillis(), true));
       }
     }
 
     var runId = UUID.randomUUID().toString();
-    if (idempotency != null && !idempotency.isBlank()) {
+    if (idempotency != null) {
       runByIdempotency.putIfAbsent(idempotency, runId);
     }
 
     var sessionLane = "session:" + request.sessionKey().trim();
-    var globalLane = requestedLane == null || requestedLane.isBlank() ? "main" : requestedLane.trim();
+    var globalLane = blankToNull(request.lane()) == null ? "main" : request.lane().trim();
 
-    scheduler.enqueue(sessionLane, () ->
-        scheduler.enqueue(globalLane, () -> agentEngine.run(runId, request, eventBus))
-    );
+    scheduler.enqueue(
+        sessionLane,
+        () -> scheduler.enqueue(globalLane, () -> agentEngine.run(runId, request, eventBus).toFuture()));
 
-    return new AcceptedRun(runId, false);
+    return Mono.just(new AcceptedRunResponse(runId, "accepted", System.currentTimeMillis(), false));
   }
 
-  public CompletableFuture<RunSnapshot> waitForRun(String runId, Duration timeout) {
+  public Mono<WaitResponse> waitFor(String runId, Duration timeout) {
     return eventBus.waitFor(runId)
-        .orTimeout(timeout.toMillis(), TimeUnit.MILLISECONDS)
-        .exceptionally(err -> new RunSnapshot(runId, "timeout", null, null, err.getMessage()));
+        .timeout(timeout)
+        .map(RunSnapshot::toWaitResponse)
+        .onErrorResume(err -> Mono.just(new WaitResponse(runId, "timeout", null, null, err.getMessage())));
   }
 
-  public RunEventBus events() {
+  public reactor.core.publisher.Flux<GatewayEvent> events(String runId) {
+    return eventBus.events(runId);
+  }
+
+  public RunEventBus eventBus() {
     return eventBus;
   }
 
-  public record AcceptedRun(String runId, boolean cached) {
-    public Map<String, Object> asMap() {
-      return Map.of(
-          "runId", runId,
-          "status", "accepted",
-          "cached", cached
-      );
+  private static String blankToNull(String value) {
+    if (value == null || value.isBlank()) {
+      return null;
     }
+    return value;
   }
 }

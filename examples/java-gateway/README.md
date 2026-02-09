@@ -1,63 +1,75 @@
-# Java Gateway (JDK 17)
+# Java Gateway (Spring Boot + Reactor, JDK 17)
 
-This is a learning-oriented Java implementation of OpenClaw gateway core ideas:
+This example implements a learning-oriented gateway architecture aligned with OpenClaw core ideas:
 
-- **Accepted + async run** (`/agent` returns `runId` immediately)
-- **agent.wait semantics** (`/agent/wait` blocks on lifecycle end/error)
-- **Event streams** (`lifecycle`, `tool`, `assistant`)
-- **Lane scheduler** (session lane + global lane)
+- **Accepted + async run** (`POST /agent` returns `runId` immediately)
+- **`agent.wait` semantics** (`GET /agent/wait` blocks until lifecycle end/error or timeout)
+- **Event streams** (`lifecycle`, `tool`, `assistant`) via SSE
+- **Lane scheduler** (`session:<key>` serialization + global lane concurrency)
 
-It is intentionally minimal so you can evolve it into a distributed design.
+It is intentionally in-memory and interface-first so you can evolve it into a distributed version.
+
+## Endpoints
+
+- `POST /agent`
+- `GET /agent/wait?runId=<id>&timeoutMs=30000`
+- `GET /agent/events/{runId}` (SSE)
 
 ## Run
 
 ```bash
 cd examples/java-gateway
-mvn -q compile
-mvn -q exec:java -Dexec.mainClass=com.openclaw.gateway.Main
+mvn spring-boot:run
 ```
 
-(If `exec-maven-plugin` is unavailable in your environment, run with `java -cp target/classes ...`.)
+Server runs on `http://127.0.0.1:18789`.
 
-## Try it
+## Quick try
 
 ```bash
-# 1) submit
-curl -X POST 'http://127.0.0.1:18789/agent?sessionKey=main&body=hello&idempotencyKey=abc'
+# 1) submit (accepted immediately)
+curl -s -X POST 'http://127.0.0.1:18789/agent' \
+  -H 'content-type: application/json' \
+  -d '{
+    "sessionKey": "main",
+    "body": "hello gateway",
+    "channel": "internal",
+    "idempotencyKey": "demo-1"
+  }'
 
-# 2) wait
-curl 'http://127.0.0.1:18789/agent/wait?runId=<RUN_ID>&timeoutMs=30000'
+# 2) wait for lifecycle terminal
+curl -s 'http://127.0.0.1:18789/agent/wait?runId=<RUN_ID>&timeoutMs=30000'
+
+# 3) stream events
+curl -N 'http://127.0.0.1:18789/agent/events/<RUN_ID>'
 ```
 
 ## Source map
 
-- `GatewayCore`:
-  - accept request, dedupe by idempotency key
-  - enqueue into `session:<key>` then global lane
-  - expose wait API via `RunEventBus`
-- `LaneScheduler`:
-  - in-memory lane queue with configurable concurrency
-- `RunEventBus`:
-  - pub/sub events and run completion snapshots
-- `MockAgentEngine`:
-  - emits lifecycle/tool/assistant events to simulate a real agent loop
-- `GatewayHttpServer`:
-  - tiny HTTP shell (`/agent`, `/agent/wait`)
+- `GatewayCore`
+  - request validation + idempotency cache
+  - lane admission (`session:<key>` then global lane)
+  - wait API + event stream API
+- `LaneScheduler`
+  - in-memory lane queue with per-lane concurrency cap
+- `RunEventBus`
+  - publishes events and completes run waiters on lifecycle `end/error`
+- `GatewayHttpServer`
+  - WebFlux controller
+- `AgentEngine` + `MockAgentEngine`
+  - pluggable runtime interface + demo implementation
 
-## How to evolve to distributed mode
+## Distributed evolution path
 
-Recommended refactor path:
+A clean progression from this sample:
 
-1. Replace in-memory `LaneScheduler` with a durable queue backend.
-2. Replace `RunEventBus` with pub/sub (Kafka, NATS, Redis Streams).
-3. Persist run metadata (`runId -> status`) in a database.
-4. Keep `GatewayCore` orchestration API stable; swap implementations behind interfaces.
+1. Replace `LaneScheduler` with durable queue-based admission (e.g., Redis Streams / Kafka / SQS).
+2. Replace `RunEventBus` with pub/sub fanout and durable run-state storage.
+3. Keep `GatewayCore` orchestration contract stable; swap implementation behind interfaces.
+4. Split services:
+   - API gateway service (`/agent`, `/agent/wait`, `/agent/events`)
+   - orchestrator service (lane admission + retries)
+   - worker service (`AgentEngine` execution)
+   - event service (stream fanout + replay)
 
-A practical split:
-
-- **Gateway API service**: accept, wait, stream endpoints.
-- **Run orchestrator**: lane admission control + retries.
-- **Worker service**: executes `AgentEngine`.
-- **Event service**: fan-out lifecycle/tool/assistant streams.
-
-This mirrors the same control-plane/data-plane separation used by OpenClaw's gateway design.
+This keeps control-plane and data-plane concerns separable from day one.

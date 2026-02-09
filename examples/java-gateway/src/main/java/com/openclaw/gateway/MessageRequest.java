@@ -1,7 +1,7 @@
 package com.openclaw.gateway;
 
 /**
- * Normalized inbound message passed to the gateway core.
+ * Normalized inbound message payload.
  */
 public record MessageRequest(
     String sessionKey,
@@ -9,14 +9,7 @@ public record MessageRequest(
     String channel,
     String accountId,
     String threadId,
-    String idempotencyKey
+    String idempotencyKey,
+    String lane
 ) {
-  public MessageRequest {
-    if (sessionKey == null || sessionKey.isBlank()) {
-      throw new IllegalArgumentException("sessionKey is required");
-    }
-    if (body == null || body.isBlank()) {
-      throw new IllegalArgumentException("body is required");
-    }
-  }
 }
