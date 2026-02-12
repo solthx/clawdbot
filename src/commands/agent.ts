@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { AgentCommandOpts } from "./agent/types.js";
 import {
   listAgentIds,
@@ -22,10 +23,12 @@ import {
   resolveThinkingDefault,
 } from "../agents/model-selection.js";
 import { runEmbeddedPiAgent } from "../agents/pi-embedded.js";
+import { resolveSandboxConfigForAgent, resolveSandboxRuntimeStatus } from "../agents/sandbox.js";
 import { buildWorkspaceSkillSnapshot } from "../agents/skills.js";
 import { getSkillsSnapshotVersion } from "../agents/skills/refresh.js";
 import { resolveAgentTimeoutMs } from "../agents/timeout.js";
 import { ensureAgentWorkspace } from "../agents/workspace.js";
+import { resolveMemoryFlushSettings } from "../auto-reply/reply/memory-flush.js";
 import {
   formatThinkingLevels,
   formatXHighModelHint,
@@ -37,7 +40,7 @@ import {
 } from "../auto-reply/thinking.js";
 import { formatCliCommand } from "../cli/command-format.js";
 import { type CliDeps, createDefaultDeps } from "../cli/deps.js";
-import { loadConfig } from "../config/config.js";
+import { loadConfig, type OpenClawConfig } from "../config/config.js";
 import {
   resolveAgentIdFromSessionKey,
   resolveSessionFilePath,
@@ -60,6 +63,95 @@ import { deliverAgentCommandResult } from "./agent/delivery.js";
 import { resolveAgentRunContext } from "./agent/run-context.js";
 import { updateSessionStoreAfterAgentRun } from "./agent/session-store.js";
 import { resolveSession } from "./agent/session.js";
+
+async function maybeRunSessionExpiryMemoryFlush(params: {
+  enabled: boolean;
+  cfg: OpenClawConfig;
+  sessionEntry?: SessionEntry;
+  sessionId: string;
+  sessionKey?: string;
+  sessionAgentId: string;
+  provider: string;
+  model: string;
+  agentDir: string;
+  workspaceDir: string;
+  resolvedThinkLevel?: ThinkLevel;
+  resolvedVerboseLevel?: VerboseLevel;
+}) {
+  if (!params.enabled || !params.sessionEntry || !params.sessionKey) {
+    return;
+  }
+  const entry = params.sessionEntry;
+  const previousSessionId = entry.sessionId?.trim();
+  if (!previousSessionId || previousSessionId === params.sessionId) {
+    return;
+  }
+  if (isCliProvider(params.provider, params.cfg)) {
+    return;
+  }
+  const runtime = resolveSandboxRuntimeStatus({
+    cfg: params.cfg,
+    sessionKey: params.sessionKey,
+  });
+  if (runtime.sandboxed) {
+    const sandboxCfg = resolveSandboxConfigForAgent(params.cfg, runtime.agentId);
+    if (sandboxCfg.workspaceAccess !== "rw") {
+      return;
+    }
+  }
+  const flushSettings = resolveMemoryFlushSettings(params.cfg);
+  if (!flushSettings) {
+    return;
+  }
+
+  const flushRunId = randomUUID();
+  registerAgentRunContext(flushRunId, {
+    sessionKey: params.sessionKey,
+    verboseLevel: params.resolvedVerboseLevel,
+  });
+  try {
+    try {
+      await runWithModelFallback({
+        cfg: params.cfg,
+        provider: params.provider,
+        model: params.model,
+        agentDir: params.agentDir,
+        fallbacksOverride: resolveAgentModelFallbacksOverride(params.cfg, params.sessionAgentId),
+        run: (providerOverride, modelOverride) =>
+          runEmbeddedPiAgent({
+            sessionId: previousSessionId,
+            sessionKey: params.sessionKey,
+            agentId: params.sessionAgentId,
+            sessionFile: resolveSessionFilePath(previousSessionId, entry, {
+              agentId: params.sessionAgentId,
+            }),
+            workspaceDir: params.workspaceDir,
+            config: params.cfg,
+            prompt: flushSettings.prompt,
+            provider: providerOverride,
+            model: modelOverride,
+            thinkLevel: params.resolvedThinkLevel,
+            verboseLevel: params.resolvedVerboseLevel,
+            timeoutMs: resolveAgentTimeoutMs({ cfg: params.cfg }),
+            runId: flushRunId,
+            extraSystemPrompt: flushSettings.systemPrompt,
+            senderIsOwner: true,
+            messageTo: entry.lastTo,
+            messageChannel: entry.lastChannel,
+            messageThreadId: entry.lastThreadId,
+            groupId: entry.groupId,
+            groupChannel: entry.groupChannel,
+            groupSpace: entry.space,
+            authProfileId: entry.authProfileOverride,
+          }),
+      });
+    } catch {
+      // Best-effort only: session rollover should never block the user's main turn.
+    }
+  } finally {
+    clearAgentRunContext(flushRunId);
+  }
+}
 
 export async function agentCommand(
   opts: AgentCommandOpts,
@@ -94,6 +186,7 @@ export async function agentCommand(
     }
   }
   const agentCfg = cfg.agents?.defaults;
+  const flushOnSessionExpiry = agentCfg?.compaction?.memoryFlush?.onSessionExpiry === true;
   const sessionAgentId = agentIdOverride ?? resolveAgentIdFromSessionKey(opts.sessionKey?.trim());
   const workspaceDirRaw = resolveAgentWorkspaceDir(cfg, sessionAgentId);
   const agentDir = resolveAgentDir(cfg, sessionAgentId);
@@ -365,6 +458,21 @@ export async function agentCommand(
         });
       }
     }
+    await maybeRunSessionExpiryMemoryFlush({
+      enabled: flushOnSessionExpiry && isNewSession,
+      cfg,
+      sessionEntry,
+      sessionId,
+      sessionKey,
+      sessionAgentId,
+      provider,
+      model,
+      agentDir,
+      workspaceDir,
+      resolvedThinkLevel,
+      resolvedVerboseLevel,
+    });
+
     const sessionFile = resolveSessionFilePath(sessionId, sessionEntry, {
       agentId: sessionAgentId,
     });
