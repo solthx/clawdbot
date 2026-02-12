@@ -19,6 +19,7 @@ describe("config compaction settings", () => {
                   reserveTokensFloor: 12_345,
                   memoryFlush: {
                     enabled: false,
+                    onSessionExpiry: true,
                     softThresholdTokens: 1234,
                     prompt: "Write notes.",
                     systemPrompt: "Flush memory now.",
@@ -40,6 +41,7 @@ describe("config compaction settings", () => {
       expect(cfg.agents?.defaults?.compaction?.reserveTokensFloor).toBe(12_345);
       expect(cfg.agents?.defaults?.compaction?.mode).toBe("safeguard");
       expect(cfg.agents?.defaults?.compaction?.memoryFlush?.enabled).toBe(false);
+      expect(cfg.agents?.defaults?.compaction?.memoryFlush?.onSessionExpiry).toBe(true);
       expect(cfg.agents?.defaults?.compaction?.memoryFlush?.softThresholdTokens).toBe(1234);
       expect(cfg.agents?.defaults?.compaction?.memoryFlush?.prompt).toBe("Write notes.");
       expect(cfg.agents?.defaults?.compaction?.memoryFlush?.systemPrompt).toBe("Flush memory now.");
